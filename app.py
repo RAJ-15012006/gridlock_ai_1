@@ -7,97 +7,120 @@ from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
 
+st.set_page_config(
+    page_title="ParkSense AI - Bengaluru",
+    page_icon="🚨",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ── CUSTOM CSS ─────────────────────────────────────────────
 st.markdown("""
 <style>
+    :root {
+        --bg: #0b1120;
+        --surface: #101a31;
+        --surface-2: #0f172a;
+        --surface-3: #14213d;
+        --text: #eef6ff;
+        --muted: #94a3b8;
+        --border: rgba(148, 163, 184, 0.12);
+        --primary: #ff5a5f;
+        --primary-2: #ff8a3d;
+        --accent: #38bdf8;
+        --success: #22c55e;
+        --warning: #f59e0b;
+    }
 
-/* Import futuristic font */
-@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;800&display=swap');
+    html, body, [class*="css"] {
+        background: var(--bg);
+    }
 
-html, body, [class*="css"] {
-    font-family: 'Orbitron', sans-serif;
-}
+    .stApp {
+        background:
+            radial-gradient(circle at top, rgba(255, 90, 95, 0.08), transparent 18%),
+            linear-gradient(180deg, #0f172a 0%, #0b1120 100%);
+    }
 
-/* Main app */
-.stApp{
-    background:#020617;
-}
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 3rem;
+    }
 
-/* Headers */
-h1{
-    color:#00ffff !important;
-    font-family:'Orbitron',sans-serif !important;
-    font-size:60px !important;
-    font-weight:800 !important;
-    text-shadow:
-0 0 4px rgba(0,255,255,0.4);
-}
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0f172a, #111827);
+        border-right: 1px solid var(--border);
+    }
 
-h2,h3{
-    color:#38bdf8 !important;
-    font-family:'Orbitron',sans-serif !important;
-}
+    [data-testid="stSidebar"] section {
+        background: transparent;
+    }
 
-/* Sidebar */
-[data-testid="stSidebar"]{
-    background:#050d17;
-    border-right:2px solid #00ffff;
-}
+    h1, h2, h3, h4 {
+        color: var(--text) !important;
+        letter-spacing: 0.2px;
+    }
 
-/* Metrics */
-[data-testid="metric-container"]{
-    background:#08111f !important;
-    border:1px solid #00ffff !important;
-    border-radius:15px !important;
-    box-shadow:
-        0px 0px 15px rgba(0,255,255,.35);
-}
+    p, li, span, div {
+        color: var(--muted);
+    }
 
-/* Metric values */
-[data-testid="stMetricValue"]{
-    color:#00ffff !important;
-    font-weight:700 !important;
-}
+    div[data-testid="stMetric"] {
+        background: linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(15, 23, 42, 0.98));
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 0.8rem 1rem;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+    }
 
-/* Metric labels */
-[data-testid="stMetricLabel"]{
-    color:white !important;
-}
+    div[data-testid="stMetricLabel"] {
+        color: var(--muted) !important;
+    }
 
-/* Dataframes */
-[data-testid="stDataFrame"]{
-    border:1px solid #00ffff !important;
-    border-radius:15px;
-}
+    div[data-testid="stMetricValue"] {
+        font-size: 1.8rem !important;
+        color: var(--text) !important;
+    }
 
-/* Buttons */
-.stButton > button{
-    background:#00ffff !important;
-    color:black !important;
-    border:none !important;
-    font-weight:bold !important;
-    border-radius:10px !important;
-}
+    div[data-testid="stMetricDelta"] {
+        color: var(--warning) !important;
+    }
 
-/* Selectboxes */
-.stSelectbox label{
-    color:#00ffff !important;
-}
+    .section-card {
+        background: linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(17, 24, 39, 0.98));
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 1rem;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+    }
 
-/* Radio buttons */
-.stRadio label{
-    color:white !important;
-}
+    .app-hero {
+        background: linear-gradient(90deg, rgba(255, 90, 95, 0.1), rgba(56, 189, 248, 0.06));
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 1rem 1.2rem;
+        margin-bottom: 1rem;
+    }
 
-/* Tabs */
-button[data-baseweb="tab"]{
-    color:#00ffff !important;
-}
-            
-            
+    div[data-testid="stDataFrame"] {
+        border-radius: 14px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+    }
 
+    .stPlotlyChart {
+        filter: drop-shadow(0 15px 25px rgba(0,0,0,0.18));
+    }
+
+    .stButton > button {
+        background: linear-gradient(90deg, var(--primary), var(--primary-2));
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 0.45rem 1rem;
+    }
 </style>
 """, unsafe_allow_html=True)
-
 
 # ── LOAD DATA ─────────────────────────────────────────────
 @st.cache_data
@@ -119,19 +142,10 @@ def load_data():
 df, station_score, junction_impact, daily_trend = load_data()
 
 # ── SIDEBAR ───────────────────────────────────────────────
-with st.sidebar:
-    col1, col2, col3 = st.columns([1,2,1])
-
-    with col2:
-        st.image(
-            "assets/logo.png",
-            width=200
-        )
-
-st.sidebar.title("🚨 GridLock AI")
-st.sidebar.markdown("**AI-driven Parking Intelligence**\n for Bengaluru Traffic Enforcement")
+st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/thumb/a/a6/Flipkart_logo.svg/200px-Flipkart_logo.svg.png", width=120)
+st.sidebar.title("🚨 ParkSense AI")
+st.sidebar.markdown("**AI-driven Parking Intelligence**\nBengaluru Traffic Enforcement")
 st.sidebar.divider()
-
 
 page = st.sidebar.radio("Navigate", [
     "📊 Overview Dashboard",
@@ -147,11 +161,11 @@ page = st.sidebar.radio("Navigate", [
 if page == "📊 Overview Dashboard":
     st.markdown("""
     <div class="app-hero">
-        <h1 style="margin:0 0 0.25rem 0;">🚨 GridLock AI</h1>
-        
+        <h1 style="margin:0 0 0.25rem 0;">🚨 ParkSense AI</h1>
+        <p style="margin:0; color:#cbd5e1;">Bengaluru Traffic Police · AI-Driven Enforcement Dashboard</p>
     </div>
     """, unsafe_allow_html=True)
-    #st.divider()
+    st.divider()
 
     # KPI Row
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -167,7 +181,7 @@ if page == "📊 Overview Dashboard":
     with col5:
         st.metric("Commercial Violations", f"{df['near_commercial'].sum():,}")
 
-    #st.divider()
+    st.divider()
 
     col1, col2 = st.columns(2)
     with col1:
