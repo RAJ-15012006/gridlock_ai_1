@@ -1,0 +1,808 @@
+================================================================================
+PARKSENSE AI — FULL CODE WALKTHROUGH
+Flipkart Gridlock Hackathon 2.0 | Theme 1: Poor Visibility on Parking-Induced
+Congestion
+================================================================================
+
+This document explains, section by section, exactly what the two pieces of
+code in this project do and why each step exists. It covers:
+
+  PART 1  —  The data pipeline notebook (Kaggle/Colab .ipynb code)
+              File purpose: clean the raw police dataset, detect hotspots,
+              score congestion impact, tag zones, build the recommendation
+              engine, and export everything the dashboard needs.
+
+  PART 2  —  The Streamlit dashboard (app.py)
+              File purpose: load the pipeline's output files and present
+              them as a six-view interactive command dashboard for judges
+              and (in a real deployment) for police command staff.
+
+Read PART 1 first — app.py only works because the notebook produces the CSV
+files it depends on. Nothing in app.py re-does the heavy computation; it only
+visualizes what the notebook already calculated.
+
+--------------------------------------------------------------------------------
+HOW THE TWO FILES FIT TOGETHER
+--------------------------------------------------------------------------------
+
+   [ Raw CSV from HackerEarth ]
+              |
+              v
+   ┌─────────────────────────────┐
+   │   THE NOTEBOOK (.ipynb)      │   <-- PART 1 of this document
+   │   - cleans data               │
+   │   - clusters hotspots         │
+   │   - scores congestion impact  │
+   │   - tags zones                │
+   │   - builds heatmap            │
+   │   - exports 5 files           │
+   └─────────────────────────────┘
+              |
+              v
+   cleaned_violations.csv, station_scores.csv, junction_summary.csv,
+   daily_trend.csv, parking_heatmap.html
+              |
+              v
+   ┌─────────────────────────────┐
+   │   THE DASHBOARD (app.py)     │   <-- PART 2 of this document
+   │   - reads the 5 files above   │
+   │   - renders 6 interactive     │
+   │     dashboard pages           │
+   └─────────────────────────────┘
+
+If the notebook is re-run with new data, the dashboard automatically reflects
+it the next time it's launched — no dashboard code changes are needed.
+
+
+================================================================================
+PART 1 — THE DATA PIPELINE NOTEBOOK (.ipynb)
+================================================================================
+
+OVERALL PURPOSE
+----------------
+Turn 298,450 raw, messy police violation log rows into:
+  (a) a list of geographic "hotspots" where illegal parking clusters,
+  (b) a 0–100 "Congestion Score" for every police station,
+  (c) an estimated road-capacity-reduction percentage for every junction,
+  (d) a zone label (Metro / Commercial / Event / General) for every record,
+  (e) a plain-language patrol recommendation for any named station,
+  (f) an interactive Folium heatmap, and
+  (g) five export files the Streamlit dashboard reads.
+
+This is intentionally NOT a machine-learning prediction model. There is no
+train/test split, no accuracy/R² score, and no target variable being
+predicted. This is a SPATIAL INTELLIGENCE + RULE-BASED SCORING system: every
+number it produces is a deterministic, explainable calculation over the real
+data, which is exactly what a "concept note / prototype" style hackathon
+problem statement is asking for — judges can trace every output back to a
+specific, inspectable formula.
+
+
+SECTION-BY-SECTION WALKTHROUGH
+--------------------------------
+
+1) IMPORTS
+   --------
+   pandas / numpy        -> tabular data handling and numeric arrays
+   json                  -> the violation_type column stores multiple
+                             violation types per row as a JSON-encoded list
+                             (e.g. '["WRONG PARKING","NO PARKING"]'); this
+                             must be parsed before it can be analyzed
+   folium + HeatMap       -> builds the interactive geographic heatmap
+   sklearn.cluster.DBSCAN -> the clustering algorithm used for hotspot
+                             detection
+   sklearn.preprocessing.StandardScaler -> used in an earlier draft of the
+                             pipeline; superseded by the haversine approach
+                             below, kept imported for compatibility
+   warnings.filterwarnings('ignore') -> suppresses noisy pandas/sklearn
+                             deprecation warnings so the notebook output
+                             stays readable during a live demo
+
+2) LOAD THE DATASET
+   -----------------
+       df = pd.read_csv(".../jan to may police violation_anonymized....csv")
+
+   Loads the official 298,450-row HackerEarth-provided dataset. The shape is
+   printed immediately (298450, 24) as a sanity check — if this number looks
+   wrong, something failed silently upstream (wrong file path, truncated
+   download, etc.), so printing it first is a cheap but important guard rail.
+
+3) PARSE THE violation_type COLUMN
+   --------------------------------
+       def parse_violation(val):
+           try:
+               parsed = json.loads(val)
+               return parsed if isinstance(parsed, list) else [val]
+           except:
+               return [str(val)]
+
+       df['violation_list']    = df['violation_type'].apply(parse_violation)
+       df['primary_violation'] = df['violation_list'].apply(lambda x: x[0] ...)
+       df['violation_count']   = df['violation_list'].apply(len)
+
+   WHY THIS EXISTS: a single police report can record more than one
+   violation at once (e.g. "wrong parking" AND "no entry"). The raw column
+   stores this as a JSON array string, not a clean single value. This
+   function:
+     - tries to JSON-decode the string into a real Python list
+     - falls back to wrapping the raw value in a list if decoding fails
+       (protects against malformed or legacy-format rows instead of
+       crashing the whole pipeline on one bad row)
+   From the parsed list it derives:
+     - primary_violation: the first/main violation type, used everywhere a
+       single category label is needed (charts, recommendations)
+     - violation_count: how many violation types were recorded in that one
+       incident — used later as a "repeat offender" signal in the
+       congestion score (multi_violations)
+
+4) DATETIME NORMALIZATION
+   -----------------------
+       df['created_datetime'] = pd.to_datetime(df['created_datetime'],
+                                                  format='mixed', utc=True)
+       df['hour_IST']    = (df['created_datetime'].dt.hour + 5) % 24
+       df['day_of_week'] = df['created_datetime'].dt.day_name()
+       df['month']       = df['created_datetime'].dt.month_name()
+
+   WHY THIS EXISTS: the raw timestamps are stored in UTC and in mixed
+   formats (some rows have a different timestamp string layout than
+   others — format='mixed' tells pandas to figure out each row's format
+   individually instead of crashing on the first inconsistency).
+
+   The +5 conversion to IST is a simplification (India Standard Time is
+   UTC+5:30, so this is approximate to the hour, not the half-hour) — it is
+   precise enough for "what hour did this happen" analysis but is flagged
+   here as a known simplification, not a hidden bug, in case it needs more
+   precision later.
+
+   day_of_week and month are extracted because every later "when should
+   patrol be deployed" question depends on knowing the day/hour pattern,
+   not just the date.
+
+5) JUNCTION FLAG
+   --------------
+       df['junction_name'] = df['junction_name'].fillna('No Junction')
+       df['at_junction']   = df['junction_name'] != 'No Junction'
+
+   Many violations are not at a named junction (mid-block parking, for
+   example). This creates a clean boolean flag (at_junction) so later code
+   can answer "what fraction of this station's violations happen exactly at
+   a junction (i.e., directly blocking an intersection) vs. somewhere along
+   a street?" — this distinction matters because junction-blocking
+   violations have a much bigger effect on traffic flow than mid-block ones.
+
+6) ZONE TAGGING — Metro / Commercial / Event / General
+   -----------------------------------------------------
+       metro_keywords      = ['metro', 'namma metro', 'railway station', ...]
+       commercial_keywords = ['mall', 'market', 'plaza', ..., 'gandhi nagar',
+                               'chickpete', 'balepet', 'kempe gowda', ...]
+       event_keywords       = ['ground', 'stadium', 'park', 'maidan',
+                               'arena', 'exhibition', 'grounds']
+
+       loc = df['location'].fillna('').str.lower()
+       df['near_metro']      = loc.str.contains('|'.join(metro_keywords))
+       df['near_commercial'] = loc.str.contains('|'.join(commercial_keywords))
+       df['near_event']      = loc.str.contains('|'.join(event_keywords))
+
+       # then repeated again using junction_name as a second pass:
+       junc = df['junction_name'].fillna('').str.lower()
+       df['near_metro']      |= junc.str.contains('metro|railway|station')
+       df['near_commercial'] |= junc.str.contains('market|plaza|mall|commercial')
+
+       df['zone_type'] = 'General'
+       df.loc[df['near_metro'],      'zone_type'] = 'Metro Zone'
+       df.loc[df['near_event'],      'zone_type'] = 'Event Zone'
+       df.loc[df['near_commercial'], 'zone_type'] = 'Commercial Zone'
+
+   WHY THIS EXISTS: the problem statement explicitly calls out "commercial
+   areas, metro stations, and events" as the locations where spillover
+   parking causes the worst congestion. This section is the system's
+   direct answer to that requirement.
+
+   HOW IT WORKS: it does simple, transparent keyword/substring matching —
+   not a machine-learning classifier — against two text fields:
+     (1) the free-text `location` (full address string), and then
+     (2) the structured `junction_name`, as a second pass.
+   The second pass exists because the first pass, using `location` alone,
+   under-tagged real commercial/metro junctions whose address text didn't
+   contain an obvious keyword (e.g. "Upparpet" violations were initially
+   tagged "General" even though they cluster around Kempe Gowda Circle and
+   Gandhi Nagar — both clearly commercial localities). Adding locality-name
+   keywords (gandhi nagar, chickpete, balepet, kempe gowda, city market) and
+   re-checking the junction_name field fixed this — this fix was applied
+   iteratively after inspecting real sample rows, which is why the keyword
+   lists look hand-tuned rather than generic.
+
+   ORDER MATTERS: zone_type is overwritten in sequence (General → Metro →
+   Event → Commercial), so if a location matches more than one category,
+   Commercial Zone wins last. This is a deliberate but simple tie-break
+   rule, not a sophisticated multi-label system — worth knowing as a
+   limitation if extending this later.
+
+7) VEHICLE SEVERITY WEIGHTING
+   ----------------------------
+       severity_map = {
+           'PRIVATE BUS': 5, 'BUS': 5,
+           'LGV': 4, 'HGV': 4,
+           'MAXI-CAB': 3, 'VAN': 3, 'GOODS AUTO': 3,
+           'CAR': 2, 'PASSENGER AUTO': 2,
+           'SCOOTER': 1, 'MOTOR CYCLE': 1, 'MOPED': 1
+       }
+       df['vehicle_severity'] = df['vehicle_type'].map(severity_map).fillna(2)
+
+   WHY THIS EXISTS: a parked bus blocks far more road width and for longer
+   than a parked scooter. Treating every violation as equally "bad" would
+   under-state the real traffic impact of heavy-vehicle violations. This is
+   a manually assigned 1–5 severity scale (5 = largest vehicles, 1 =
+   two-wheelers), with unrecognized vehicle types defaulting to 2 (a
+   car-equivalent, the safest "middle" assumption) instead of crashing or
+   being dropped from the dataset.
+
+8) ENFORCEMENT GAP FLAG
+   ----------------------
+       df['validated'] = df['validation_status'] == 'approved'
+
+   WHY THIS EXISTS: validation_status records whether a violation report
+   was actually approved/acted on. Flipping this to a clean boolean lets
+   later code quickly compute "what % of violations at this station were
+   NEVER resolved?" — this became one of the most quotable numbers in the
+   whole project (61.3% unresolved citywide), because it's direct evidence
+   that the *current* reactive, patrol-based system has a large blind spot
+   — exactly the gap the problem statement asks an AI system to close.
+
+9) HOTSPOT DETECTION — DBSCAN WITH THE HAVERSINE METRIC
+   ------------------------------------------------------
+       df_geo = df.dropna(subset=['latitude', 'longitude']).copy()
+       coords_rad = np.radians(df_geo[['latitude', 'longitude']].values)
+       db = DBSCAN(eps=0.5/6371, algorithm='ball_tree',
+                   metric='haversine', min_samples=50).fit(coords_rad)
+       df_geo['cluster'] = db.labels_
+
+   WHAT DBSCAN DOES: DBSCAN (Density-Based Spatial Clustering of
+   Applications with Noise) groups points that are densely packed together
+   into "clusters," and labels isolated points that don't belong to any
+   dense group as "noise" (cluster label -1). Unlike k-means, it does not
+   need you to specify the number of clusters in advance — it discovers
+   however many natural hotspots exist in the data. This is exactly the
+   right tool for "find illegal parking hotspots" because hotspots are, by
+   definition, places where violations are unusually dense — DBSCAN finds
+   exactly that pattern automatically.
+
+   WHY HAVERSINE, NOT PLAIN EUCLIDEAN DISTANCE: latitude/longitude are
+   angles on a sphere, not flat (x, y) coordinates. Treating them as flat
+   coordinates (ordinary Euclidean distance) introduces growing distortion
+   away from the equator and especially distorts east–west vs north–south
+   distances differently. The haversine metric calculates true great-circle
+   distance on Earth's surface, so a cluster radius set in real kilometers
+   means the same physical distance everywhere in Bengaluru. This was a
+   deliberate upgrade over an earlier draft of the pipeline that used
+   StandardScaler + plain Euclidean DBSCAN — the haversine version is more
+   geographically accurate and is mentioned explicitly in the presentation
+   because it signals methodological rigor to judges.
+
+   PARAMETER CHOICES:
+     - eps=0.5/6371 -> DBSCAN's `eps` is a radius in whatever units the
+       input is in. Since coordinates were converted to radians and the
+       metric is haversine, distances are effectively in "radians of arc on
+       a unit sphere." Dividing 0.5 (kilometers) by 6371 (Earth's radius in
+       km) converts "0.5 km neighborhood radius" into the correct radian
+       value DBSCAN needs. In plain English: two violations are considered
+       part of the same neighborhood if they are within ~500 meters of each
+       other.
+     - min_samples=50 -> a cluster must contain at least 50 violations to
+       count as a real hotspot. This filters out small, statistically
+       insignificant clumps of 2–3 stray points and keeps the output
+       focused on hotspots large enough to justify a real patrol decision.
+     - algorithm='ball_tree' -> the only DBSCAN tree algorithm that
+       supports the haversine metric efficiently at this row count; this is
+       a required pairing, not a free choice.
+
+   RESULT REPORTED: 62 distinct hotspot clusters, covering 296,646 of
+   298,450 geotagged points (99.4%) — i.e. almost every violation with valid
+   coordinates falls inside some real, identifiable hotspot rather than
+   being scattered noise.
+
+   AN EARLIER ATTEMPT AND WHY IT CHANGED: the very first version of this
+   step ran DBSCAN on only a random 50,000-row SAMPLE of the data, because
+   running it on the full 298,450 rows initially crashed the free-tier
+   Google Colab notebook by exhausting available RAM. Two things fixed
+   this: (1) moving the heavy computation to Kaggle's notebook environment,
+   which offers far more free RAM than Colab's free tier, and (2) switching
+   from a dense Euclidean StandardScaler approach to the much more
+   memory-efficient ball_tree + haversine combination, which made it
+   possible to cluster the FULL dataset rather than a 17% sample — this
+   matters because a sample could miss real hotspots that exist in the
+   other 83% of the data.
+
+10) ROAD-CAPACITY-REDUCTION FORMULA
+    ----------------------------------
+        capacity_map = {5: 2.0, 4: 1.5, 3: 1.2, 2: 1.0, 1: 0.5}
+        df_geo['lane_impact'] = df_geo['vehicle_severity'].map(capacity_map)
+
+        junction_impact = df_geo[df_geo['at_junction']].groupby('junction_name').agg(
+            total_violations  = ('id', 'count'),
+            lat               = ('latitude', 'mean'),
+            lon               = ('longitude', 'mean'),
+            avg_severity      = ('vehicle_severity', 'mean'),
+            total_lane_impact = ('lane_impact', 'sum'),
+            zone_type         = ('zone_type', lambda x: x.mode()[0])
+        ).reset_index()
+
+        junction_impact['capacity_reduction_pct'] = (
+            (junction_impact['total_lane_impact'] /
+             (junction_impact['total_violations'] * 4)) * 100
+        ).clip(upper=95).round(1)
+
+    WHY THIS EXISTS: a raw violation COUNT tells you how often parking
+    happens at a junction, but not how much it actually impedes traffic.
+    This formula is the notebook's attempt to translate violation
+    frequency + vehicle size into a single, intuitive "% of road capacity
+    blocked" number — directly answering the brief's request to "quantify
+    [the] impact on traffic flow."
+
+    HOW THE NUMBER IS BUILT:
+      - lane_impact converts each violation's severity (1–5) into an
+        estimated number of road lanes effectively blocked (0.5 lanes for a
+        two-wheeler up to 2.0 lanes for a bus/heavy vehicle).
+      - For each junction, all lane_impact values are summed
+        (total_lane_impact), then divided by (total_violations × 4) — the
+        "× 4" assumes a typical junction has 4 usable lanes, so this
+        expresses lane-blockage as a percentage of total available road
+        capacity at that junction.
+      - .clip(upper=95) caps the result at 95% — this is a deliberate
+        sanity bound, since a junction can never be modeled as 100%+
+        permanently blocked (real intersections still carry some traffic
+        even at their worst), and uncapped values could otherwise look
+        implausible to a technical judge.
+
+    HONEST LIMITATION (worth stating out loud in Q&A): this formula is an
+    ESTIMATE built from violation counts and vehicle-size assumptions, not
+    from actual road-sensor or speed/flow data. It is explicitly a
+    presentable proxy metric for a 5-day prototype, not a calibrated
+    traffic-engineering model. The presentation frames it this way too —
+    as a transparent formula judges can inspect, not a black-box "AI"
+    score.
+
+11) CONGESTION SCORE (PER POLICE STATION)
+    -----------------------------------------
+        def normalize(s):
+            return (s - s.min()) / (s.max() - s.min() + 1e-9)
+
+        station_score = df.groupby('police_station').agg(
+            total_violations      = ('id', 'count'),
+            junction_violations   = ('at_junction', 'sum'),
+            avg_severity           = ('vehicle_severity', 'mean'),
+            multi_violations       = ('violation_count', lambda x: (x > 1).sum()),
+            enforcement_gap         = ('validated', lambda x: (~x).sum()),
+            metro_violations        = ('near_metro', 'sum'),
+            commercial_violations   = ('near_commercial', 'sum')
+        ).reset_index()
+
+        station_score['congestion_score'] = (
+            normalize(station_score['total_violations'])      * 0.28 +
+            normalize(station_score['junction_violations'])   * 0.28 +
+            normalize(station_score['avg_severity'])           * 0.15 +
+            normalize(station_score['multi_violations'])       * 0.10 +
+            normalize(station_score['enforcement_gap'])        * 0.10 +
+            normalize(station_score['metro_violations'])       * 0.05 +
+            normalize(station_score['commercial_violations'])  * 0.04
+        ) * 100
+
+    WHY THIS EXISTS: this is the single most important output of the whole
+    pipeline — a 0–100 score that lets command staff instantly compare ANY
+    two stations on overall "how badly does parking here hurt traffic and
+    how broken is current enforcement," instead of staring at seven
+    separate raw numbers per station.
+
+    HOW IT WORKS — A WEIGHTED, NORMALIZED COMPOSITE SCORE:
+      - normalize() rescales every raw column to a common 0–1 range using
+        min-max normalization (the "+1e-9" in the denominator just guards
+        against a divide-by-zero if a column happened to have zero
+        variance — a defensive coding habit, not something that triggers
+        in this dataset).
+      - Each normalized factor is then multiplied by a hand-chosen weight
+        (28% total violations, 28% junction-adjacent violations, 15%
+        average vehicle severity, 10% repeat multi-violation incidents, 10%
+        enforcement gap, 5% metro proximity, 4% commercial proximity) and
+        summed, then scaled to a 0–100 range for readability.
+      - The weights were chosen by the developer to reflect that RAW
+        volume and JUNCTION-BLOCKING violations matter most (28% each),
+        vehicle size matters a fair amount (15%), and zone-type proximity
+        is a smaller, supporting signal (5% + 4%) since zone tagging is
+        already a separate, more granular output (see Section 6).
+      - This is a heuristic weighting scheme, not a statistically fitted
+        model — it is transparent and explainable (any judge can see
+        exactly why a station's score is what it is) rather than a
+        black-box machine-learning output, which fits the "prototype /
+        concept" nature of this hackathon submission.
+
+    RESULT REPORTED: Upparpet tops the list at 77.7/100 ("CRITICAL"), with
+    34,284 of its 34,468 violations occurring directly at junctions —
+    meaning Upparpet's problem isn't just volume, it's that nearly every
+    single violation there is actively blocking an intersection.
+
+12) 7-DAY ROLLING TREND
+    ------------------------
+        df['date'] = df['created_datetime'].dt.date
+        daily_trend = df.groupby(['date', 'police_station']).size() \
+                        .reset_index(name='daily_violations')
+        daily_trend['7day_avg'] = daily_trend.groupby('police_station')[
+            'daily_violations'].transform(
+                lambda x: x.rolling(7, min_periods=1).mean().round(1))
+
+    WHY THIS EXISTS: a single daily violation count is noisy (weekends,
+    holidays, and one-off events all cause spikes/dips that don't reflect a
+    real underlying trend). Computing a 7-day rolling average per station
+    smooths out that day-to-day noise and lets the dashboard show whether a
+    station's violation rate is genuinely rising, falling, or flat over
+    time — this is what turns the system from purely "descriptive" (what
+    happened) toward slightly "predictive/proactive" (what's the
+    trajectory), which was identified as a gap to close versus a purely
+    backward-looking system. min_periods=1 ensures the very first few days
+    of a station's history still get a (less smoothed) average instead of
+    showing blank/NaN values.
+
+13) THE ENFORCEMENT RECOMMENDATION ENGINE
+    ----------------------------------------
+        def get_recommendation(station_name):
+            row = station_score[station_score['police_station'] == station_name]
+            ...
+            top_hours = station_df['hour_IST'].value_counts()
+            daytime = top_hours[top_hours.index.isin(range(6, 22))]
+            peak_hour = int(daytime.idxmax()) if not daytime.empty \
+                        else int(top_hours.idxmax())
+            peak_day = station_df['day_of_week'].mode()[0]
+            top_viol = station_df['primary_violation'].mode()[0]
+            top_zone = station_df['zone_type'].mode()[0]
+
+            if score >= 60:   units, priority = 5, "CRITICAL"
+            elif score >= 40: units, priority = 3, "HIGH"
+            elif score >= 20: units, priority = 2, "MEDIUM"
+            else:             units, priority = 1, "LOW"
+
+            return { station, priority, congestion_score,
+                      recommended_patrol_units, deploy_at_hour_IST,
+                      peak_day, top_violation_type, hotspot_zone,
+                      unresolved_violations }
+
+    WHY THIS EXISTS: this is the function that turns every prior
+    calculation into a plain-English instruction a patrol commander could
+    actually act on — it is the system's direct answer to "enable targeted
+    enforcement."
+
+    HOW IT WORKS, STEP BY STEP:
+      - Looks up the station's pre-computed congestion_score and
+        enforcement_gap from station_score (Section 11).
+      - Computes the DAYTIME peak hour specifically by filtering to hours
+        6–22 (6 AM–10 PM) before taking the most frequent hour. This fix
+        was added after noticing that, for some stations (e.g. "City
+        Market"), the single most common hour overall was midnight —
+        caused by a genuine real-world pattern (wholesale/commercial
+        vendors and goods vehicles operating at night when streets are
+        empty), not a bug. Rather than report a midnight patrol
+        recommendation that would look wrong to a judge without context,
+        the function restricts "peak hour" to the daytime window that
+        patrol deployment actually targets, while the midnight pattern
+        itself remains visible elsewhere in the data as a genuine insight.
+      - peak_day and top_violation_type use the statistical mode (the most
+        frequently occurring value) of that station's records.
+      - top_zone reports which zone type (Metro/Commercial/Event/General)
+        is most common among that station's violations.
+      - Priority tier and recommended patrol-unit count are assigned by
+        simple score thresholds: ≥60 = CRITICAL (5 units), ≥40 = HIGH (3
+        units), ≥20 = MEDIUM (2 units), otherwise LOW (1 unit). This is a
+        simple, explicit rule table — easy for a non-technical police
+        officer to understand and trust, instead of an opaque model
+        prediction.
+
+    EXAMPLE OUTPUT (Upparpet): CRITICAL priority, 5 recommended patrol
+    units, deploy 8:00–10:00 AM, peak day Sunday, top violation "Wrong
+    Parking," 19,072 unresolved cases. This single dictionary is exactly
+    what the dashboard's "Enforcement Planner" page (see Part 2) displays
+    for any station the user selects.
+
+14) HEATMAP CONSTRUCTION
+    --------------------------
+        m = folium.Map(location=[12.9716, 77.5946], zoom_start=12,
+                         tiles='CartoDB dark_matter')
+
+        HeatMap(heat_data[[...]].values.tolist(), radius=10, blur=15,
+                 name='Violation Heatmap',
+                 gradient={0.2:'blue', 0.4:'lime', 0.6:'orange', 1.0:'red'}
+                 ).add_to(m)
+
+        for _, row in junction_impact.head(20).iterrows():
+            color = 'red' if row['capacity_reduction_pct'] > 60 else ...
+            folium.CircleMarker(location=[row['lat'], row['lon']], ...,
+                popup=f"<b>{row['junction_name']}</b><br>Violations...").add_to(m)
+
+        HeatMap(congestion_heat.values.tolist(), radius=15, blur=20,
+                 name='Congestion Impact',
+                 gradient={0.2:'green', 0.5:'yellow', 0.8:'orange', 1.0:'red'}
+                 ).add_to(m)
+
+        folium.LayerControl().add_to(m)
+        m.save(".../parking_heatmap.html")
+
+    WHY THIS EXISTS: the problem statement explicitly says "no heatmap of
+    parking violations vs. congestion impact" exists today — so producing
+    one is a literal, non-negotiable requirement, not just a nice-to-have
+    visual.
+
+    HOW IT WORKS — TWO HEATMAP LAYERS PLUS MARKERS, ALL TOGGLEABLE:
+      - Layer 1 ("Violation Heatmap"): a density heatmap of every raw
+        violation's lat/long, weighted by vehicle_severity, colored on a
+        blue→lime→orange→red gradient. This answers "where do violations
+        physically happen."
+      - Circle markers for the top 20 highest-violation junctions, colored
+        red/orange/green based on their capacity_reduction_pct, each with a
+        popup showing the junction name, violation count, capacity
+        reduction %, and zone type. This adds the specific, clickable
+        "actionable" layer on top of the general density layer.
+      - Layer 2 ("Congestion Impact"): a second heatmap, this time weighted
+        by each station's congestion_score rather than raw violation
+        density, on a separate green→yellow→orange→red gradient. This is
+        the literal "heatmap... vs congestion impact" comparison the brief
+        asks for — violations density and congestion impact are
+        deliberately kept as two independently toggleable layers (via
+        folium.LayerControl()) so a viewer can switch between "where do
+        violations happen" and "where does it actually hurt traffic" and
+        see that they aren't always the same places.
+      - tiles='CartoDB dark_matter' gives a dark-themed base map, both for
+        visual contrast with the colored heatmap and to match the dark
+        aesthetic used throughout the Streamlit dashboard.
+
+15) SAVING THE EXPORT FILES
+    ------------------------
+        df_geo.to_csv(".../cleaned_violations.csv", index=False)
+        station_score.to_csv(".../station_scores.csv", index=False)
+        junction_impact.to_csv(".../junction_summary.csv", index=False)
+        daily_trend.to_csv(".../daily_trend.csv", index=False)
+        m.save(".../parking_heatmap.html")
+
+    These five files are the ONLY hand-off between the notebook and the
+    dashboard. Each one maps to a specific dashboard feature:
+      - cleaned_violations.csv  -> raw per-violation data with all derived
+                                    columns (zone_type, hour_IST, etc.) —
+                                    used for KPIs, hour/day charts, and the
+                                    in-app heatmap rebuild
+      - station_scores.csv      -> one row per police station with its
+                                    congestion_score and related stats —
+                                    used for the Overview rankings and the
+                                    Enforcement Planner
+      - junction_summary.csv    -> one row per junction with its
+                                    capacity_reduction_pct — used for the
+                                    Zone Analysis junction charts
+      - daily_trend.csv         -> 7-day rolling average per station per
+                                    day — used for the Trend Analysis page
+
+
+================================================================================
+PART 2 — THE STREAMLIT DASHBOARD (app.py)
+================================================================================
+
+OVERALL PURPOSE
+----------------
+app.py is the "front end" judges actually click through. It loads the five
+files produced by the notebook (Part 1) and renders them as a live,
+interactive, six-page command dashboard — turning static CSVs and a
+stand-alone HTML heatmap into a single cohesive tool that looks and feels
+like something Bengaluru Traffic Police could actually run in a control room.
+
+It does NOT repeat any of the heavy computation (DBSCAN, scoring formulas,
+zone tagging) — all of that already happened in the notebook. app.py's job is
+purely presentation, filtering, and light on-the-fly aggregation for charts.
+
+
+SECTION-BY-SECTION WALKTHROUGH
+--------------------------------
+
+1) PAGE CONFIG & CUSTOM CSS
+   ----------------------------
+       st.set_page_config(page_title="ParkSense AI - Bengaluru",
+                            page_icon="🚨", layout="wide",
+                            initial_sidebar_state="expanded")
+       st.markdown("""<style> ... </style>""", unsafe_allow_html=True)
+
+   set_page_config must be the very first Streamlit call in the script
+   (Streamlit enforces this) — it sets the browser tab title/icon and tells
+   Streamlit to use the full browser width ("wide" layout) instead of a
+   narrow centered column, which matters here because the dashboard relies
+   on multi-column layouts and a wide map.
+
+   The injected CSS gives the app its dark, command-room aesthetic: a dark
+   background, gradient metric cards with a red accent border, and styling
+   for Streamlit's built-in st.metric widgets so the big numbers (like "62"
+   or "298,450") pop visually instead of looking like default Streamlit
+   gray boxes.
+
+2) CACHED DATA LOADING
+   ------------------------
+       @st.cache_data
+       def load_data():
+           violations = pd.read_csv("cleaned_violations.csv")
+           stations   = pd.read_csv("station_scores.csv")
+           junctions  = pd.read_csv("junction_summary.csv")
+           trend      = pd.read_csv("daily_trend.csv")
+           violations['created_datetime'] = pd.to_datetime(...)
+           trend['date'] = pd.to_datetime(trend['date'])
+           return violations, stations, junctions, trend
+
+       df, station_score, junction_impact, daily_trend = load_data()
+
+   @st.cache_data tells Streamlit to run this function once and reuse the
+   result on every subsequent rerun (Streamlit reruns the ENTIRE script top
+   to bottom on every user interaction — clicking a button, moving a
+   slider, changing a dropdown — so without caching, all four CSVs would be
+   re-read from disk on every single click, which would make the app feel
+   slow). The datetime columns are re-parsed here because CSV files store
+   everything as plain text — pandas does not remember that a column was
+   originally a datetime once it's been written to and read back from CSV.
+
+3) SIDEBAR NAVIGATION
+   ------------------------
+       st.sidebar.title("🚨 ParkSense AI")
+       page = st.sidebar.radio("Navigate", ["📊 Overview Dashboard", ...])
+       selected_station = st.sidebar.selectbox("Filter by Station", ...)
+
+   This is a single-page-app pattern built entirely with Streamlit's basic
+   widgets: a sidebar radio button acts as a makeshift "page router" — the
+   value of `page` is checked further down with a chain of if/elif blocks,
+   and only the matching block's code actually renders. The
+   `selected_station` dropdown is built once in the sidebar but, in the
+   version of the code reviewed here, is only fully wired into the
+   Enforcement Planner page logic (selected independently there) — this was
+   flagged as a known rough edge ("the station filter does nothing on the
+   heatmap page") worth tightening before final submission so every page
+   consistently respects the sidebar filter, not just some of them.
+
+4) PAGE 1 — OVERVIEW DASHBOARD
+   ----------------------------
+   KPI ROW: five st.metric() cards across the top — Total Violations,
+   Hotspot Clusters, Enforcement Gap, Metro Zone Violations, Commercial
+   Violations. These are the "first thing a judge sees" numbers, deliberately
+   chosen to be the most striking headline stats from Part 1.
+
+   TOP 10 STATIONS BAR CHART: built with Plotly Express
+   (px.bar(top10, x='congestion_score', y='police_station', orientation='h',
+   color='congestion_score', color_continuous_scale='Reds')) — a horizontal
+   bar chart is used (rather than vertical) so that the long police-station
+   names remain fully readable instead of being rotated or truncated.
+
+   VIOLATION TYPE DONUT (px.pie(..., hole=0.4)): shows the breakdown of the
+   top 8 primary_violation categories so judges immediately see "Wrong
+   Parking" dominates without needing to read a table.
+
+   ENFORCEMENT GAP TABLE: computes gap_pct = enforcement_gap / total_violations
+   *100 ON THE FLY (this is the one place app.py does its own small
+   calculation rather than just displaying a pre-computed notebook column),
+   sorts descending, and displays the 15 stations with the worst resolution
+   rate — directly visualizing the "61.3% enforcement gap" headline stat
+   broken down by station instead of as one aggregate number.
+
+5) PAGE 2 — HOTSPOT HEATMAP
+   ----------------------------
+       m = folium.Map(..., tiles='CartoDB dark_matter')
+       map_type = st.radio("Map Layer", ["Violation Density", "Congestion Impact"])
+       sample_size = st.slider("Data Points", 10000, 100000, 50000, 10000)
+       ...
+       st_folium(m, width=900, height=600)
+
+   Rather than simply embedding the static parking_heatmap.html the
+   notebook already generated, this page REBUILDS the Folium map live
+   inside Streamlit using the streamlit-folium bridge library
+   (st_folium), so the user can interactively choose:
+     - which of the two heatmap layers to view (Violation Density vs.
+       Congestion Impact — mirroring the notebook's two-layer design from
+       Part 1, Section 14), and
+     - how many data points to sample (10,000–100,000) before rendering,
+       which is a deliberate performance/quality trade-off: heatmaps with
+       very large point counts can become slow to render in a browser, so
+       a random .sample() of the chosen size is taken before building the
+       HeatMap layer, trading a small amount of completeness for a
+       responsive live demo.
+   The same top-20-junction circle markers from the notebook's heatmap are
+   re-added here, color-coded by capacity_reduction_pct, with the same
+   popups.
+
+6) PAGE 3 — ZONE ANALYSIS
+   ----------------------------
+   Three st.metric() cards for Metro / Commercial / Event zone totals,
+   followed by:
+     - a donut chart of df['zone_type'].value_counts() with explicit
+       color_discrete_map so Commercial/Metro/Event/General always render
+       in the same consistent colors every time the app reloads (without
+       this, Plotly would assign colors somewhat arbitrarily based on
+       category order)
+     - a zone_filter selectbox that lets the user pick a single zone type
+       (or "All") and instantly re-filters junction_impact to show only
+       that zone's top 15 junctions in a horizontal bar chart, colored by
+       capacity_reduction_pct
+
+7) PAGE 4 — TIME INTELLIGENCE
+   ----------------------------
+   Three time-based charts, all built from simple pandas .value_counts():
+     - Violations by Hour (IST): a 24-bar chart showing the citywide hourly
+       pattern at a glance
+     - Violations by Day of Week: reindexed against an explicit
+       day_order = ['Monday', ..., 'Sunday'] list so the bars always
+       display in calendar order rather than in whatever arbitrary order
+       pandas happens to return distinct values
+     - Monthly Trend: a line chart, similarly reindexed against an
+       explicit month_order list (November through April, matching the
+       dataset's actual date range) so the line reads left-to-right
+       chronologically instead of alphabetically
+
+8) PAGE 5 — ENFORCEMENT PLANNER
+   ----------------------------
+   This page is the live, interactive version of the notebook's
+   get_recommendation() function (Part 1, Section 13) — re-implemented
+   directly in Streamlit so a user can pick ANY station from a dropdown and
+   see its recommendation computed in real time, rather than only seeing
+   the three example stations the notebook happened to print.
+
+   It recomputes the same priority-tier thresholds (≥60 CRITICAL / ≥40 HIGH
+   / ≥20 MEDIUM / else LOW) and the same daytime-only peak-hour logic
+   (filtering to hours 6–22 before taking the mode) directly in the
+   Streamlit code, then displays the result as four large st.metric() cards
+   (Congestion Score, Patrol Units Needed, Deploy At, Unresolved Cases),
+   four st.info() boxes (Peak Day, Top Violation, Zone Type, Junction
+   Violations), an hourly bar chart for that specific station, and finally
+   a full sortable table of EVERY station's priority tier and recommended
+   unit count — so a commander can see one station in depth and the whole
+   city's priority ranking on the same page.
+
+9) PAGE 6 — TREND ANALYSIS
+   ----------------------------
+   A st.multiselect() lets the user choose which of the top-5
+   highest-scoring stations to compare (defaulting to the top 3 pre-
+   selected), then plots their 7-day rolling averages (from daily_trend.csv,
+   produced in Part 1, Section 12) as overlapping colored line charts via
+   px.line(..., line_shape='spline', color_discrete_sequence=
+   px.colors.qualitative.Bold) — smoothed ("spline") lines and a
+   bold/distinct color palette make it easy to visually tell each station's
+   trend line apart even when several are shown together. The raw daily
+   numbers behind the chart are also shown in a table underneath for anyone
+   who wants the exact figures rather than just the visual trend.
+
+
+WHY STREAMLIT, FOLIUM, AND PLOTLY SPECIFICALLY
+-------------------------------------------------
+  - Streamlit: turns a plain Python script into a shareable web app with
+    almost no front-end code, which matters enormously inside a 5-day
+    hackathon timeline — there is no separate HTML/CSS/JavaScript layer to
+    build or maintain.
+  - Folium (built on the JavaScript library Leaflet.js): the standard
+    Python tool for rendering interactive, pannable/zoomable geographic
+    maps with heatmap and marker overlays, and integrates with Streamlit
+    via the streamlit-folium bridge package used here (st_folium).
+  - Plotly Express: produces interactive charts (hover tooltips, zoom, pan)
+    with very little code per chart, and its dark-theme-friendly styling
+    options (plot_bgcolor, paper_bgcolor, font_color) were used throughout
+    to match the dashboard's overall dark aesthetic rather than defaulting
+    to Plotly's standard white background.
+
+
+KNOWN LIMITATIONS / HONEST CAVEATS (useful for judge Q&A)
+-------------------------------------------------------------
+  1. The sidebar's "Filter by Station" selector is not yet wired into every
+     page (notably the heatmap page) — it should ideally narrow every chart
+     to the selected station consistently, and tightening this is a planned
+     follow-up rather than a hidden flaw.
+  2. The Congestion Score and Road-Capacity-Reduction formulas are
+     transparent, hand-weighted heuristics validated against real violation
+     data — not formulas fitted against ground-truth road-sensor or traffic-
+     flow measurements, since no such ground-truth data was provided in
+     this hackathon round. This is stated openly in the presentation rather
+     than implied to be more rigorous than it is.
+  3. The +5-hour IST conversion is accurate to the hour but not to the
+     half-hour (true IST is UTC+5:30) — acceptable for hourly peak-pattern
+     analysis, but worth knowing if finer time precision is ever needed.
+  4. Zone tagging (Metro/Commercial/Event/General) is keyword-based, not a
+     verified GIS lookup against an authoritative list of actual metro
+     stations, malls, and event venues — it is accurate enough to validate
+     the problem statement's premise but could be replaced with a proper
+     geofencing layer in a production version.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
