@@ -6,6 +6,7 @@ from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
+import os
 
 st.set_page_config(
     page_title="ParkSense AI - Bengaluru",
@@ -142,7 +143,8 @@ def load_data():
 df, station_score, junction_impact, daily_trend = load_data()
 
 # ── SIDEBAR ───────────────────────────────────────────────
-st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/thumb/a/a6/Flipkart_logo.svg/200px-Flipkart_logo.svg.png", width=120)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+st.sidebar.image(os.path.join(current_dir, "assets", "traffic_light.png"), width=120)
 st.sidebar.title("🚨 ParkSense AI")
 st.sidebar.markdown("**AI-driven Parking Intelligence**\nBengaluru Traffic Enforcement")
 st.sidebar.divider()
@@ -156,6 +158,12 @@ page = st.sidebar.radio("Navigate", [
     "📈 Trend Analysis"
 ])
 # FIX 2 — removed broken sidebar station filter
+
+st.sidebar.write("")
+st.sidebar.write("")
+st.sidebar.divider()
+st.sidebar.caption("Powered by")
+st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/thumb/a/a6/Flipkart_logo.svg/200px-Flipkart_logo.svg.png", width=100)
 
 # ── PAGE 1: OVERVIEW ──────────────────────────────────────
 if page == "📊 Overview Dashboard":
