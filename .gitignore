@@ -1,0 +1,6 @@
+.venv/
+venv/
+__pycache__/
+.env
+cleaned_violations.csv
+.DS_Store
