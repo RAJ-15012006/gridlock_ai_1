@@ -125,7 +125,7 @@ st.markdown("""
 # ── LOAD DATA ─────────────────────────────────────────────
 @st.cache_data
 def load_data():
-    violations = pd.read_csv("cleaned_violations.csv")
+    violations = pd.read_csv("cleaned_violations.csv.gz")
     stations   = pd.read_csv("station_scores.csv")
     junctions  = pd.read_csv("junction_summary.csv")
     trend      = pd.read_csv("daily_trend.csv")
