@@ -254,21 +254,37 @@ elif page == "🗺️ Hotspot Heatmap":
             tiles='CartoDB dark_matter'
         )
 
-        sample = df[['latitude', 'longitude', 'vehicle_severity']].dropna().sample(
-            min(sample_size, len(df)), random_state=42)
-
         if map_type == "Violation Density":
+            sample = df[['latitude', 'longitude', 'vehicle_severity']].dropna().sample(
+                min(sample_size, len(df)), random_state=42).copy()
+            # Normalize severity to [0.1, 1.0] to prevent Leaflet.heat saturation
+            max_sev = sample['vehicle_severity'].max() if not sample['vehicle_severity'].empty else 1
+            min_sev = sample['vehicle_severity'].min() if not sample['vehicle_severity'].empty else 0
+            if max_sev > min_sev:
+                sample['weight'] = 0.1 + 0.9 * (sample['vehicle_severity'] - min_sev) / (max_sev - min_sev)
+            else:
+                sample['weight'] = 1.0
+
             HeatMap(
-                sample[['latitude', 'longitude', 'vehicle_severity']].values.tolist(),
+                sample[['latitude', 'longitude', 'weight']].values.tolist(),
                 radius=10, blur=15,
                 gradient={0.2: 'blue', 0.4: 'lime', 0.6: 'orange', 1.0: 'red'}
             ).add_to(m)
         else:
             station_geo = df.dropna(subset=['latitude', 'longitude']).merge(
                 station_score[['police_station', 'congestion_score']], on='police_station')
+            geo_sample = station_geo.dropna(subset=['congestion_score']).sample(
+                min(sample_size, len(station_geo)), random_state=42).copy()
+            # Normalize congestion_score to [0.1, 1.0] to show distinct relative impact
+            max_cong = geo_sample['congestion_score'].max() if not geo_sample['congestion_score'].empty else 1
+            min_cong = geo_sample['congestion_score'].min() if not geo_sample['congestion_score'].empty else 0
+            if max_cong > min_cong:
+                geo_sample['weight'] = 0.1 + 0.9 * (geo_sample['congestion_score'] - min_cong) / (max_cong - min_cong)
+            else:
+                geo_sample['weight'] = 1.0
+
             HeatMap(
-                station_geo[['latitude', 'longitude', 'congestion_score']].dropna()
-                .sample(min(sample_size, len(station_geo)), random_state=42).values.tolist(),
+                geo_sample[['latitude', 'longitude', 'weight']].values.tolist(),
                 radius=15, blur=20,
                 gradient={0.2: 'green', 0.5: 'yellow', 0.8: 'orange', 1.0: 'red'}
             ).add_to(m)
